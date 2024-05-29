@@ -4,18 +4,18 @@ import os
 import re
 from typing import Literal
 
-import cassio
+import pg8000
 from app.bedrock import calculate_query_embedding
 from app.utils import generate_presigned_url
 from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
 
-cassio.init(
-    token=os.environ['ASTRA_DB_APPLICATION_TOKEN'],
-    database_id=os.environ['ASTRA_DB_ID'],
-    keyspace=os.environ.get('ASTRA_DB_KEYSPACE'),
-)
+DB_NAME = os.environ.get("DB_NAME", "postgres")
+DB_HOST = os.environ.get("DB_HOST", "")
+DB_USER = os.environ.get("DB_USER", "postgres")
+DB_PASSWORD = os.environ.get("DB_PASSWORD", "password")
+DB_PORT = int(os.environ.get("DB_PORT", 5432))
 
 
 class SearchResult(BaseModel):
@@ -82,16 +82,34 @@ def search_related_docs(bot_id: str, limit: int, query: str) -> list[SearchResul
     query_embedding = calculate_query_embedding(query)
     logger.info(f"query_embedding: {query_embedding}")
 
-    session = cassio.config.resolve_session()
+    conn = pg8000.connect(
+        database=DB_NAME,
+        host=DB_HOST,
+        port=DB_PORT,
+        user=DB_USER,
+        password=DB_PASSWORD,
+    )
 
-    search_query = f"""
-    SELECT id, botid, content, source, embedding
-    FROM items
-    WHERE botid = {bot_id}
-    ORDER BY text_embedding ANN OF {query_embedding}
-    LIMIT {limit} """
-
-    results = session.execute(search_query)
+    try:
+        with conn.cursor() as cursor:
+            # NOTE: <-> is the KNN by L2 distance in pgvector.
+            # If you want to use inner product or cosine distance, use <#> or <=> respectively.
+            # It's important to choose the same distance metric as the one used for indexing.
+            # Ref: https://github.com/pgvector/pgvector?tab=readme-ov-file#getting-started
+            search_query = """
+SELECT id, botid, content, source, embedding 
+FROM items 
+WHERE botid = %s 
+ORDER BY embedding <-> %s 
+LIMIT %s
+"""
+            cursor.execute(search_query, (bot_id, json.dumps(query_embedding), limit))
+            results = cursor.fetchall()
+    except Exception as e:
+        conn.rollback()
+        raise e
+    finally:
+        conn.close()
 
     logger.info(f"{len(results)} records found.")
 

@@ -3,7 +3,7 @@ import json
 import logging
 import os
 
-import cassio
+import pg8000
 import requests
 
 from app.config import DEFAULT_EMBEDDING_CONFIG
@@ -27,12 +27,12 @@ logging.basicConfig(level=logging.INFO)
 
 BEDROCK_REGION = os.environ.get("BEDROCK_REGION", "us-east-1")
 
-cassio.init(
-    token=os.environ['ASTRA_DB_APPLICATION_TOKEN'],
-    database_id=os.environ['ASTRA_DB_ID'],
-    keyspace=os.environ.get('ASTRA_DB_KEYSPACE'),
-)
 
+DB_NAME = os.environ.get("DB_NAME", "postgres")
+DB_HOST = os.environ.get("DB_HOST", "")
+DB_USER = os.environ.get("DB_USER", "postgres")
+DB_PASSWORD = os.environ.get("DB_PASSWORD", "password")
+DB_PORT = int(os.environ.get("DB_PORT", 5432))
 DOCUMENT_BUCKET = os.environ.get("DOCUMENT_BUCKET", "documents")
 
 METADATA_URI = os.environ.get("ECS_CONTAINER_METADATA_URI_V4")
@@ -48,24 +48,41 @@ def get_exec_id() -> str:
     return task_id
 
 
-def insert_to_astra(
+def insert_to_postgres(
     bot_id: str, contents: list[str], sources: list[str], embeddings: list[list[float]]
 ):
-    session = cassio.config.resolve_session()
-    delete_query = f"""DELETE FROM items WHERE botid = {bot_id}"""
-    session.execute(delete_query)
-    insert_query = f"INSERT INTO items (id, botid, content, source, embedding) VALUES (%s, %s, %s, %s, %s)"
-    values_to_insert = []
-    for i, (source, content, embedding) in enumerate(
-        zip(sources, contents, embeddings)
-    ):
-        id_ = str(ULID())
-        print(f"Preview of content {i}: {content[:200]}")
-        values_to_insert.append(
-            (id_, bot_id, content, source, json.dumps(embedding))
-        )
-        session.execute(insert_query, (id_, bot_id, content,source,embedding ))
-    print(f"Successfully inserted {len(values_to_insert)} records.")
+    conn = pg8000.connect(
+        database=DB_NAME,
+        host=DB_HOST,
+        port=DB_PORT,
+        user=DB_USER,
+        password=DB_PASSWORD,
+    )
+
+    try:
+        with conn.cursor() as cursor:
+            delete_query = "DELETE FROM items WHERE botid = %s"
+            cursor.execute(delete_query, (bot_id,))
+
+            insert_query = f"INSERT INTO items (id, botid, content, source, embedding) VALUES (%s, %s, %s, %s, %s)"
+            values_to_insert = []
+            for i, (source, content, embedding) in enumerate(
+                zip(sources, contents, embeddings)
+            ):
+                id_ = str(ULID())
+                print(f"Preview of content {i}: {content[:200]}")
+                values_to_insert.append(
+                    (id_, bot_id, content, source, json.dumps(embedding))
+                )
+            cursor.executemany(insert_query, values_to_insert)
+        conn.commit()
+        print(f"Successfully inserted {len(values_to_insert)} records.")
+    except Exception as e:
+        conn.rollback()
+        raise e
+    finally:
+        conn.close()
+
 
 def update_sync_status(
     user_id: str,
@@ -184,8 +201,8 @@ def main(
 
         print(f"Number of chunks: {len(contents)}")
 
-        # Insert records into astra
-        insert_to_astra(bot_id, contents, sources, embeddings)
+        # Insert records into postgres
+        insert_to_postgres(bot_id, contents, sources, embeddings)
         status_reason = "Successfully inserted to vector store."
     except Exception as e:
         print("[ERROR] Failed to embed.")

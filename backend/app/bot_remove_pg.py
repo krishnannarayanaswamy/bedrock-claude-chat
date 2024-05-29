@@ -2,26 +2,43 @@ import json
 import os
 
 import boto3
-import cassio
+import pg8000
 from app.repositories.apigateway import delete_api_key, find_usage_plan_by_id
 from app.repositories.cloudformation import delete_stack_by_bot_id, find_stack_by_bot_id
 from app.repositories.common import RecordNotFoundError, decompose_bot_id
 
-cassio.init(
-    token=os.environ['ASTRA_DB_APPLICATION_TOKEN'],
-    database_id=os.environ['ASTRA_DB_ID'],
-    keyspace=os.environ.get('ASTRA_DB_KEYSPACE'),
-)
+DB_HOST = os.environ.get("DB_HOST", "")
+DB_USER = os.environ.get("DB_USER", "postgres")
+DB_PASSWORD = os.environ.get("DB_PASSWORD", "password")
+DB_PORT = int(os.environ.get("DB_PORT", 5432))
+DB_NAME = os.environ.get("DB_NAME", "postgres")
 DOCUMENT_BUCKET = os.environ.get("DOCUMENT_BUCKET", "documents")
 
 s3_client = boto3.client("s3")
 
 
-def delete_from_astra(bot_id: str):
-    """Delete data related to `bot_id` from vector store (i.e. Astra)."""
-    session = cassio.config.resolve_session()
-    delete_query = f"""DELETE FROM items WHERE botid = {bot_id}"""
-    session.execute(delete_query)
+def delete_from_postgres(bot_id: str):
+    """Delete data related to `bot_id` from vector store (i.e. PostgreSQL)."""
+    conn = pg8000.connect(
+        database=DB_NAME,
+        host=DB_HOST,
+        port=DB_PORT,
+        user=DB_USER,
+        password=DB_PASSWORD,
+    )
+
+    try:
+        with conn.cursor() as cursor:
+            delete_query = "DELETE FROM items WHERE botid = %s"
+            cursor.execute(delete_query, (bot_id,))
+        conn.commit()
+        print(f"Successfully deleted records for bot_id: {bot_id}")
+    except Exception as e:
+        conn.rollback()
+        print(f"Error deleting records for bot_id: {bot_id}")
+        print(e)
+    finally:
+        conn.close()
 
 
 def delete_from_s3(user_id: str, bot_id: str):
@@ -71,7 +88,7 @@ def handler(event, context):
     user_id = pk
     bot_id = decompose_bot_id(sk)
 
-    delete_from_astra(bot_id)
+    delete_from_postgres(bot_id)
     delete_from_s3(user_id, bot_id)
 
     # Check if cloudformation stack exists
